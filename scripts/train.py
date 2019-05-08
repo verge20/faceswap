@@ -47,15 +47,19 @@ class Train():
                              "all the parameters (--timelapse-input-A and "
                              "--timelapse-input-B).")
 
+        timelapse_output = None
+        if self.args.timelapse_output is not None:
+            timelapse_output = str(get_folder(self.args.timelapse_output))
+
         for folder in (self.args.timelapse_input_a,
                        self.args.timelapse_input_b,
-                       self.args.timelapse_output):
+                       timelapse_output):
             if folder is not None and not os.path.isdir(folder):
                 raise ValueError("The Timelapse path '{}' does not exist".format(folder))
 
         kwargs = {"input_a": self.args.timelapse_input_a,
                   "input_b": self.args.timelapse_input_b,
-                  "output": self.args.timelapse_output}
+                  "output": timelapse_output}
         logger.debug("Timelapse enabled: %s", kwargs)
         return kwargs
 
@@ -89,10 +93,7 @@ class Train():
         thread = self.start_thread()
         # queue_manager.debug_monitor(1)
 
-        if self.args.preview:
-            err = self.monitor_preview(thread)
-        else:
-            err = self.monitor_console(thread)
+        err = self.monitor(thread)
 
         self.end_thread(thread, err)
         logger.debug("Completed Training Process")
@@ -159,7 +160,10 @@ class Train():
             no_flip=self.args.no_flip,
             training_image_size=self.image_size,
             alignments_paths=self.alignments_paths,
-            preview_scale=self.args.preview_scale)
+            preview_scale=self.args.preview_scale,
+            pingpong=self.args.pingpong,
+            memory_saving_gradients=self.args.memory_saving_gradients,
+            predict=False)
         logger.debug("Loaded Model")
         return model
 
@@ -213,7 +217,11 @@ class Train():
                 break
             elif save_iteration:
                 logger.trace("Save Iteration: (iteration: %s", iteration)
-                model.save_models()
+                if self.args.pingpong:
+                    model.save_models()
+                    trainer.pingpong.switch()
+                else:
+                    model.save_models()
             elif self.save_now:
                 logger.trace("Save Requested: (iteration: %s", iteration)
                 model.save_models()
@@ -223,55 +231,30 @@ class Train():
         trainer.clear_tensorboard()
         self.stop = True
 
-    def monitor_preview(self, thread):
-        """ Generate the preview window and wait for keyboard input """
-        logger.debug("Launching Preview Monitor")
-        logger.info("R|=====================================================================")
-        logger.info("R|- Using live preview                                                -")
-        logger.info("R|- Press 'ENTER' on the preview window to save and quit              -")
-        logger.info("R|- Press 'S' on the preview window to save model weights immediately -")
-        logger.info("R|=====================================================================")
-        err = False
-        while True:
-            try:
-                with self.lock:
-                    for name, image in self.preview_buffer.items():
-                        cv2.imshow(name, image)  # pylint: disable=no-member
-
-                key = cv2.waitKey(1000)  # pylint: disable=no-member
-                if self.stop:
-                    logger.debug("Stop received")
-                    break
-                if thread.has_error:
-                    logger.debug("Thread error detected")
-                    err = True
-                    break
-                if key == ord("\n") or key == ord("\r"):
-                    logger.debug("Exit requested")
-                    break
-                if key == ord("s"):
-                    logger.info("Save requested")
-                    self.save_now = True
-            except KeyboardInterrupt:
-                logger.debug("Keyboard Interrupt received")
-                break
-        logger.debug("Closed Preview Monitor")
-        return err
-
-    def monitor_console(self, thread):
-        """ Monitor the console
-            NB: A custom function needs to be used for this because
-                input() blocks """
-        logger.debug("Launching Console Monitor")
+    def monitor(self, thread):
+        """ Monitor the console, and generate + monitor preview if requested """
+        is_preview = self.args.preview
+        logger.debug("Launching Monitor")
         logger.info("R|===============================================")
         logger.info("R|- Starting                                    -")
+        if is_preview:
+            logger.info("R|- Using live preview                          -")
         logger.info("R|- Press 'ENTER' to save and quit              -")
         logger.info("R|- Press 'S' to save model weights immediately -")
         logger.info("R|===============================================")
+
         keypress = KBHit(is_gui=self.args.redirect_gui)
         err = False
         while True:
             try:
+                if is_preview:
+                    with self.lock:
+                        for name, image in self.preview_buffer.items():
+                            cv2.imshow(name, image)  # pylint: disable=no-member
+                    cv_key = cv2.waitKey(1000)  # pylint: disable=no-member
+                else:
+                    cv_key = None
+
                 if thread.has_error:
                     logger.debug("Thread error detected")
                     err = True
@@ -279,19 +262,31 @@ class Train():
                 if self.stop:
                     logger.debug("Stop received")
                     break
+
+                # Preview Monitor
+                if is_preview and (cv_key == ord("\n") or cv_key == ord("\r")):
+                    logger.debug("Exit requested")
+                    break
+                if is_preview and cv_key == ord("s"):
+                    logger.info("Save requested")
+                    self.save_now = True
+
+                # Console Monitor
                 if keypress.kbhit():
-                    key = keypress.getch()
-                    if key in ("\n", "\r"):
+                    console_key = keypress.getch()
+                    if console_key in ("\n", "\r"):
                         logger.debug("Exit requested")
                         break
-                    if key in ("s", "S"):
+                    if console_key in ("s", "S"):
                         logger.info("Save requested")
                         self.save_now = True
+
+                sleep(1)
             except KeyboardInterrupt:
                 logger.debug("Keyboard Interrupt received")
                 break
         keypress.set_normal_term()
-        logger.debug("Closed Console Monitor")
+        logger.debug("Closed Monitor")
         return err
 
     @staticmethod

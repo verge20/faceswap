@@ -4,6 +4,7 @@
 import locale
 import os
 import platform
+import re
 import sys
 from subprocess import PIPE, Popen
 
@@ -31,6 +32,7 @@ class SysInfo():
         self.vram = gpu_stats.vram
         self.gfx_driver = gpu_stats.driver
         self.gfx_devices = gpu_stats.devices
+        self.gfx_devices_active = gpu_stats.active_devices
 
     @property
     def encoding(self):
@@ -154,6 +156,14 @@ class SysInfo():
     @property
     def cuda_version(self):
         """ Get the installed CUDA version """
+        chk = Popen("nvcc -V", shell=True, stdout=PIPE, stderr=PIPE)
+        stdout, stderr = chk.communicate()
+        if not stderr:
+            version = re.search(r".*release (?P<cuda>\d+\.\d+)", stdout.decode(self.encoding))
+            version = version.groupdict().get("cuda", None)
+            if version:
+                return version
+        # Failed to load nvcc
         if self.is_linux:
             version = self.cuda_version_linux()
         elif self.is_windows:
@@ -165,17 +175,23 @@ class SysInfo():
     @property
     def cudnn_version(self):
         """ Get the installed cuDNN version """
-        if not self._cuda_path:
+        if self.is_linux:
+            cudnn_checkfiles = self.cudnn_checkfiles_linux()
+        elif self.is_windows:
+            cudnn_checkfiles = self.cudnn_checkfiles_windows()
+
+        cudnn_checkfile = None
+        for checkfile in cudnn_checkfiles:
+            if os.path.isfile(checkfile):
+                cudnn_checkfile = checkfile
+                break
+
+        if not cudnn_checkfile:
             retval = "Not Found"
             if self.is_conda:
                 retval += ". Check Conda packages for Conda cuDNN"
             return retval
-        cudnn_checkfile = os.path.join(self._cuda_path, "include", "cudnn.h")
-        if not os.path.isfile(cudnn_checkfile):
-            retval = "Not Found"
-            if self.is_conda:
-                retval += ". Check Conda packages for Conda cuDNN"
-            return retval
+
         found = 0
         with open(cudnn_checkfile, "r") as ofile:
             for line in ofile:
@@ -196,6 +212,26 @@ class SysInfo():
                 retval += ". Check Conda packages for Conda cuDNN"
             return retval
         return "{}.{}.{}".format(major, minor, patchlevel)
+
+    @staticmethod
+    def cudnn_checkfiles_linux():
+        """ Return the checkfile locations for linux """
+        chk = os.popen("ldconfig -p | grep -P \"libcudnn.so.\\d+\" | head -n 1").read()
+        chk = chk.strip().replace("libcudnn.so.", "")
+        cudnn_vers = chk[0]
+        cudnn_path = chk[chk.find("=>") + 3:chk.find("libcudnn") - 1]
+        cudnn_path = cudnn_path.replace("lib", "include")
+        cudnn_checkfiles = [os.path.join(cudnn_path, "cudnn_v{}.h".format(cudnn_vers)),
+                            os.path.join(cudnn_path, "cudnn.h")]
+        return cudnn_checkfiles
+
+    def cudnn_checkfiles_windows(self):
+        """ Return the checkfile locations for windows """
+        # TODO A more reliable way of getting the windows location
+        if not self._cuda_path:
+            return list()
+        cudnn_checkfile = os.path.join(self._cuda_path, "include", "cudnn.h")
+        return [cudnn_checkfile]
 
     def get_cuda_path(self):
         """ Return the correct CUDA Path """
@@ -284,9 +320,11 @@ class SysInfo():
                     "gpu_devices": ", ".join(["GPU_{}: {}".format(idx, device)
                                               for idx, device in enumerate(self.gfx_devices)]),
                     "gpu_vram": ", ".join(["GPU_{}: {}MB".format(idx, int(vram))
-                                           for idx, vram in enumerate(self.vram)])}
+                                           for idx, vram in enumerate(self.vram)]),
+                    "gpu_devices_active": ", ".join(["GPU_{}".format(idx)
+                                                     for idx in self.gfx_devices_active])}
         for key in sorted(sys_info.keys()):
-            retval += ("{0: <18} {1}\n".format(key + ":", sys_info[key]))
+            retval += ("{0: <20} {1}\n".format(key + ":", sys_info[key]))
         retval += "\n=============== Pip Packages ===============\n"
         retval += self.installed_pip
         if not self.is_conda:

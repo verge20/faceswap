@@ -55,6 +55,12 @@ def set_slider_rounding(value, var, d_type, round_to, min_max):
         var.set(value)
 
 
+def adjust_wraplength(event):
+    """ dynamically adjust the wraplength of a label on event """
+    label = event.widget
+    label.configure(wraplength=event.width - 1)
+
+
 class FileHandler():
     """ Raise a filedialog box and capture input """
 
@@ -64,29 +70,6 @@ class FileHandler():
                      "'%s', variable: %s)", self.__class__.__name__, handletype, filetype, command,
                      action, variable)
         self.handletype = handletype
-        all_files = ("All files", "*.*")
-        self.filetypes = {"default": (all_files,),
-                          "alignments": (("JSON", "*.json"),
-                                         ("Pickle", "*.p"),
-                                         ("YAML", "*.yaml"),
-                                         all_files),
-                          "config": (("Faceswap config files", "*.fsw"), all_files),
-                          "csv": (("Comma separated values", "*.csv"), all_files),
-                          "image": (("Bitmap", "*.bmp"),
-                                    ("JPG", "*.jpeg", "*.jpg"),
-                                    ("PNG", "*.png"),
-                                    ("TIFF", "*.tif", "*.tiff"),
-                                    all_files),
-                          "state": (("State files", "*.json"), all_files),
-                          "log": (("Log files", "*.log"), all_files),
-                          "video": (("Audio Video Interleave", "*.avi"),
-                                    ("Flash Video", "*.flv"),
-                                    ("Matroska", "*.mkv"),
-                                    ("MOV", "*.mov"),
-                                    ("MP4", "*.mp4"),
-                                    ("MPEG", "*.mpeg"),
-                                    ("WebM", "*.webm"),
-                                    all_files)}
         self.contexts = {
             "effmpeg": {
                 "input": {"extract": "filename",
@@ -112,6 +95,41 @@ class FileHandler():
         self.retfile = getattr(self, self.handletype.lower())()
         logger.debug("Initialized %s", self.__class__.__name__)
 
+    @property
+    def filetypes(self):
+        """ Set the filetypes for opening/saving """
+        all_files = ("All files", "*.*")
+        filetypes = {"default": (all_files,),
+                     "alignments": [("JSON", "*.json"),
+                                    ("Pickle", "*.p"),
+                                    ("YAML", "*.yaml" "*.yml"),  # pylint: disable=W1403
+                                    all_files],
+                     "config": [("Faceswap config files", "*.fsw"), all_files],
+                     "csv": [("Comma separated values", "*.csv"), all_files],
+                     "image": [("Bitmap", "*.bmp"),
+                               ("JPG", "*.jpeg" "*.jpg"),  # pylint: disable=W1403
+                               ("PNG", "*.png"),
+                               ("TIFF", "*.tif" "*.tiff"),  # pylint: disable=W1403
+                               all_files],
+                     "state": [("State files", "*.json"), all_files],
+                     "log": [("Log files", "*.log"), all_files],
+                     "video": [("Audio Video Interleave", "*.avi"),
+                               ("Flash Video", "*.flv"),
+                               ("Matroska", "*.mkv"),
+                               ("MOV", "*.mov"),
+                               ("MP4", "*.mp4"),
+                               ("MPEG", "*.mpeg"),
+                               ("WebM", "*.webm"),
+                               all_files]}
+        # Add in multi-select options
+        for key, val in filetypes.items():
+            if len(val) < 3:
+                continue
+            multi = ["{} Files".format(key.title())]
+            multi.append(" ".join([ftype[1] for ftype in val if ftype[0] != "All files"]))
+            val.insert(0, tuple(multi))
+        return filetypes
+
     def set_defaults(self):
         """ Set the default filetype to be first in list of filetypes,
             or set a custom filetype if the first is not correct """
@@ -132,7 +150,7 @@ class FileHandler():
             self.set_context_handletype(command, action, variable)
 
         if self.handletype.lower() in (
-                "open", "save", "filename", "savefilename"):
+                "open", "save", "filename", "filename_multi", "savefilename"):
             kwargs["filetypes"] = self.filetypes[filetype]
             if self.defaults.get(filetype, None):
                 kwargs['defaultextension'] = self.defaults[filetype]
@@ -177,6 +195,11 @@ class FileHandler():
         logger.debug("Popping Filename browser")
         return filedialog.askopenfilename(**self.kwargs)
 
+    def filename_multi(self):
+        """ Get multiple existing file locations """
+        logger.debug("Popping Filename browser")
+        return filedialog.askopenfilenames(**self.kwargs)
+
     def savefilename(self):
         """ Get a save file location """
         logger.debug("Popping SaveFilename browser")
@@ -208,6 +231,8 @@ class Images():
         self.icons["folder"] = ImageTk.PhotoImage(file=os.path.join(
             self.pathicons, "open_folder.png"))
         self.icons["load"] = ImageTk.PhotoImage(file=os.path.join(
+            self.pathicons, "open_file.png"))
+        self.icons["load_multi"] = ImageTk.PhotoImage(file=os.path.join(
             self.pathicons, "open_file.png"))
         self.icons["context"] = ImageTk.PhotoImage(file=os.path.join(
             self.pathicons, "open_file.png"))
@@ -336,8 +361,7 @@ class Images():
                 except OSError:
                     if i == 999:
                         raise
-                    else:
-                        continue
+                    continue
                 break
 
         self.previewtrain[name][1] = ImageTk.PhotoImage(displayimg)
@@ -512,13 +536,17 @@ class Config():
         updatepreview = tk.BooleanVar()
         updatepreview.set(False)
 
+        traintimeout = tk.IntVar()
+        traintimeout.set(120)
+
         tk_vars = {"display": display,
                    "runningtask": runningtask,
                    "action": actioncommand,
                    "generate": generatecommand,
                    "consoleclear": consoleclear,
                    "refreshgraph": refreshgraph,
-                   "updatepreview": updatepreview}
+                   "updatepreview": updatepreview,
+                   "traintimeout": traintimeout}
         logger.debug(tk_vars)
         return tk_vars
 
@@ -589,8 +617,11 @@ class Config():
         """ Add to recent files """
         recent_filename = os.path.join(self.pathcache, ".recent.json")
         logger.debug("Adding to recent files '%s': (%s, %s)", recent_filename, filename, command)
-        with open(recent_filename, "rb") as inp:
-            recent_files = self.serializer.unmarshal(inp.read().decode("utf-8"))
+        if not os.path.exists(recent_filename) or os.path.getsize(recent_filename) == 0:
+            recent_files = list()
+        else:
+            with open(recent_filename, "rb") as inp:
+                recent_files = self.serializer.unmarshal(inp.read().decode("utf-8"))
         logger.debug("Initial recent files: %s", recent_files)
         filenames = [recent[0] for recent in recent_files]
         if filename in filenames:

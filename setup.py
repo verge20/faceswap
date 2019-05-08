@@ -13,9 +13,8 @@ from subprocess import CalledProcessError, run, PIPE, Popen
 
 INSTALL_FAILED = False
 # Revisions of tensorflow-gpu and cuda/cudnn requirements
-TENSORFLOW_REQUIREMENTS = {"1.2": ["8.0", "5.1"],
-                           "1.4": ["8.0", "6.0"],
-                           "1.12": ["9.0", "7.2"]}
+TENSORFLOW_REQUIREMENTS = {"==1.12.0": ["9.0", "7.2"],
+                           ">=1.13.1": ["10.0", "7.4"]}
 
 
 class Environment():
@@ -179,11 +178,13 @@ class Environment():
     def get_installed_packages(self):
         """ Get currently installed packages """
         installed_packages = dict()
-        chk = Popen("{} -m pip freeze".format(sys.executable),
+        chk = Popen("\"{}\" -m pip freeze".format(sys.executable),
                     shell=True, stdout=PIPE)
         installed = chk.communicate()[0].decode(self.encoding).splitlines()
 
         for pkg in installed:
+            if "==" not in pkg:
+                continue
             item = pkg.split("==")
             installed_packages[item[0]] = item[1]
         return installed_packages
@@ -219,11 +220,12 @@ class Environment():
                 tf_ver = key
                 break
         if tf_ver:
-            tf_ver = "tensorflow-gpu=={}.0".format(tf_ver)
+            tf_ver = "tensorflow-gpu{}".format(tf_ver)
             self.required_packages.append(tf_ver)
             return
 
         self.output.warning(
+            "The minimum Tensorflow requirement is 1.12. \n"
             "Tensorflow currently has no official prebuild for your CUDA, cuDNN "
             "combination.\nEither install a combination that Tensorflow supports or "
             "build and install your own tensorflow-gpu.\r\n"
@@ -323,7 +325,9 @@ class Checks():
             exit(0)
 
     # Check for CUDA and cuDNN
-        if self.env.enable_cuda and self.env.os_version[0] in ("Linux", "Windows"):
+        if self.env.enable_cuda and self.env.is_conda:
+            self.output.info("Skipping Cuda/cuDNN checks for Conda install")
+        elif self.env.enable_cuda and self.env.os_version[0] in ("Linux", "Windows"):
             self.cuda_check()
             self.cudnn_check()
         elif self.env.enable_cuda and self.env.os_version[0] not in ("Linux", "Windows"):
@@ -374,6 +378,15 @@ class Checks():
 
     def cuda_check(self):
         """ Check Cuda for Linux or Windows """
+        chk = Popen("nvcc -V", shell=True, stdout=PIPE, stderr=PIPE)
+        stdout, stderr = chk.communicate()
+        if not stderr:
+            version = re.search(r".*release (?P<cuda>\d+\.\d+)", stdout.decode(self.env.encoding))
+            self.env.cuda_version = version.groupdict().get("cuda", None)
+            if self.env.cuda_version:
+                self.output.info("CUDA version: " + self.env.cuda_version)
+                return
+        # Failed to load nvcc
         if self.env.os_version[0] == "Linux":
             self.cuda_check_linux()
         elif self.env.os_version[0] == "Windows":
@@ -418,8 +431,17 @@ class Checks():
 
     def cudnn_check(self):
         """ Check Linux or Windows cuDNN Version from cudnn.h """
-        cudnn_checkfile = os.path.join(self.env.cuda_path, "include", "cudnn.h")
-        if not os.path.isfile(cudnn_checkfile):
+        if self.env.os_version[0] == "Linux":
+            cudnn_checkfiles = self.cudnn_checkfiles_linux()
+        elif self.env.os_version[0] == "Windows":
+            cudnn_checkfiles = self.cudnn_checkfiles_windows()
+
+        cudnn_checkfile = None
+        for checkfile in cudnn_checkfiles:
+            if os.path.isfile(checkfile):
+                cudnn_checkfile = checkfile
+                break
+        if not cudnn_checkfile:
             self.output.error("cuDNN not found. See "
                               "https://github.com/deepfakes/faceswap/blob/master/INSTALL.md#cudnn "
                               "for instructions")
@@ -446,6 +468,26 @@ class Checks():
 
         self.env.cudnn_version = "{}.{}".format(major, minor)
         self.output.info("cuDNN version: {}.{}".format(self.env.cudnn_version, patchlevel))
+
+    @staticmethod
+    def cudnn_checkfiles_linux():
+        """ Return the checkfile locations for linux """
+        chk = os.popen("ldconfig -p | grep -P \"libcudnn.so.\\d+\" | head -n 1").read()
+        chk = chk.strip().replace("libcudnn.so.", "")
+        cudnn_vers = chk[0]
+        cudnn_path = chk[chk.find("=>") + 3:chk.find("libcudnn") - 1]
+        cudnn_path = cudnn_path.replace("lib", "include")
+        cudnn_checkfiles = [os.path.join(cudnn_path, "cudnn_v{}.h".format(cudnn_vers)),
+                            os.path.join(cudnn_path, "cudnn.h")]
+        return cudnn_checkfiles
+
+    def cudnn_checkfiles_windows(self):
+        """ Return the checkfile locations for windows """
+        # TODO A more reliable way of getting the windows location
+        if not self.env.cuda_path:
+            return list()
+        cudnn_checkfile = os.path.join(self.env.cuda_path, "include", "cudnn.h")
+        return [cudnn_checkfile]
 
     def check_system_dependencies(self):
         """ Check that system applications are installed """
@@ -538,7 +580,8 @@ class Checks():
     def check_cplus_plus(self):
         """ Check Visual C++ Redistributable 2015 is instlled for Windows """
         keys = (
-            "HKLM\\SOFTWARE\\Classes\\Installer\\Dependencies\\{d992c12e-cab2-426f-bde3-fb8c53950b0d}",
+            "HKLM\\SOFTWARE\\Classes\\Installer\\Dependencies\\"
+            "{d992c12e-cab2-426f-bde3-fb8c53950b0d}",
             "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64")
         for key in keys:
             chk = Popen("reg query {}".format(key), shell=True, stdout=PIPE, stderr=PIPE)
@@ -612,10 +655,11 @@ class Install():
 
     def install_missing_dep(self):
         """ Install missing dependencies """
-        if self.env.missing_packages:
-            self.install_python_packages()
+        # Install conda packages first as dlib will need Cuda
         if self.env.conda_missing_packages:
             self.install_conda_packages()
+        if self.env.missing_packages:
+            self.install_python_packages()
 
     def install_python_packages(self):
         """ Install required pip packages """
@@ -631,7 +675,7 @@ class Install():
         """ Install required conda packages """
         self.output.info("Installing Required Conda Packages. This may take some time...")
         for pkg in self.env.conda_missing_packages:
-            channel = None if len(pkg) !=2 else pkg[1]
+            channel = None if len(pkg) != 2 else pkg[1]
             self.conda_installer(pkg[0], channel=channel, conda_only=True)
 
     def conda_installer(self, package, channel=None, verbose=False, conda_only=False):
@@ -668,12 +712,10 @@ class Install():
         if not self.env.is_admin and not self.env.is_virtualenv:
             pipexe.append("--user")
         if package.startswith("dlib"):
-            opt = "yes" if self.env.enable_cuda else "no"
-            pipexe.extend(["--install-option=--{}".format(opt),
-                           "--install-option=DLIB_USE_CUDA"])
+            if not self.env.enable_cuda:
+                pipexe.extend(["--install-option=--no", "--install-option=DLIB_USE_CUDA"])
             if self.env.os_version[0] == "Windows":
-                pipexe.extend(["--global-option=-G",
-                               "--global-option=Visual Studio 14 2015"])
+                pipexe.extend(["--global-option=-G", "--global-option=Visual Studio 14 2015"])
             msg = ("Compiling {}. This will take a while...\n"
                    "Please ignore the following UserWarning: "
                    "'Disabling all use of wheels...'".format(package))
@@ -702,7 +744,7 @@ class Tips():
             "docker build -t deepfakes-cpu -f Dockerfile.cpu .\n\n"
             "3. Mount faceswap volume and Run it\n"
             "# without GUI\n"
-            "docker run -p 8888:8888 \\ \n"
+            "docker run -tid -p 8888:8888 \\ \n"
             "\t--hostname deepfakes-cpu --name deepfakes-cpu \\ \n"
             "\t-v {path}:/srv \\ \n"
             "\tdeepfakes-cpu\n\n"
@@ -710,7 +752,7 @@ class Tips():
             "## enable local access to X11 server\n"
             "xhost +local:\n"
             "## create container\n"
-            "nvidia-docker run -p 8888:8888 \\ \n"
+            "nvidia-docker run -tid -p 8888:8888 \\ \n"
             "\t--hostname deepfakes-cpu --name deepfakes-cpu \\ \n"
             "\t-v {path}:/srv \\ \n"
             "\t-v /tmp/.X11-unix:/tmp/.X11-unix \\ \n"
@@ -721,7 +763,8 @@ class Tips():
             "\t-e UID=`id -u` \\ \n"
             "\tdeepfakes-cpu \n\n"
             "4. Open a new terminal to run faceswap.py in /srv\n"
-            "docker exec -it deepfakes-cpu bash".format(path=sys.path[0]))
+            "docker exec -it deepfakes-cpu bash".format(
+                path=os.path.dirname(os.path.realpath(__file__))))
         self.output.info("That's all you need to do with a docker. Have fun.")
 
     def docker_cuda(self):
@@ -737,7 +780,7 @@ class Tips():
             "docker build -t deepfakes-gpu -f Dockerfile.gpu .\n\n"
             "5. Mount faceswap volume and Run it\n"
             "# without gui \n"
-            "docker run -p 8888:8888 \\ \n"
+            "docker run -tid -p 8888:8888 \\ \n"
             "\t--hostname deepfakes-gpu --name deepfakes-gpu \\ \n"
             "\t-v {path}:/srv \\ \n"
             "\tdeepfakes-gpu\n\n"
@@ -747,7 +790,7 @@ class Tips():
             "## enable nvidia device if working under bumblebee\n"
             "echo ON > /proc/acpi/bbswitch\n"
             "## create container\n"
-            "nvidia-docker run -p 8888:8888 \\ \n"
+            "nvidia-docker run -tid -p 8888:8888 \\ \n"
             "\t--hostname deepfakes-gpu --name deepfakes-gpu \\ \n"
             "\t-v {path}:/srv \\ \n"
             "\t-v /tmp/.X11-unix:/tmp/.X11-unix \\ \n"
@@ -758,7 +801,8 @@ class Tips():
             "\t-e UID=`id -u` \\ \n"
             "\tdeepfakes-gpu\n\n"
             "6. Open a new terminal to interact with the project\n"
-            "docker exec deepfakes-gpu python /srv/tools.py gui\n".format(path=sys.path[0]))
+            "docker exec deepfakes-gpu python /srv/tools.py gui\n".format(
+                path=os.path.dirname(os.path.realpath(__file__))))
 
     def macos(self):
         """ Output Tips for macOS"""
@@ -780,7 +824,7 @@ class Tips():
     def pip(self):
         """ Pip Tips """
         self.output.info("1. Install PIP requirements\n"
-                         "You may want to execute `chcp 866` in cmd line\n"
+                         "You may want to execute `chcp 65001` in cmd line\n"
                          "to fix Unicode issues on Windows when installing dependencies")
 
 

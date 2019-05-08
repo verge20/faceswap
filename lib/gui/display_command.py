@@ -193,7 +193,7 @@ class GraphDisplay(DisplayOptionalPage):  # pylint: disable=too-many-ancestors
         session = get_config().session
         if session.initialized and session.logging_disabled:
             logger.trace("Logs disabled. Hiding graph")
-            self.set_info("Graph is disabled as 'no-logs' has been selected")
+            self.set_info("Graph is disabled as 'no-logs' or 'pingpong' has been selected")
             self.display_item = None
         elif session.initialized:
             logger.trace("Loading graph")
@@ -232,3 +232,10 @@ class GraphDisplay(DisplayOptionalPage):  # pylint: disable=too-many-ancestors
             return
         for graph in self.subnotebook.children.values():
             graph.save_fig(graphlocation)
+
+    def close(self):
+        """ Clear the plots from RAM """
+        for name, graph in self.subnotebook.children.items():
+            logger.debug("Clearing: %s", name)
+            graph.clear()
+        super().close()

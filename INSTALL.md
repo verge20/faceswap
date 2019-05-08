@@ -46,7 +46,7 @@ The type of computations that the process does are well suited for graphics card
 - **A powerful CPU**
     - Laptop CPUs can often run the software, but will not be fast enough to train at reasonable speeds
 - **A powerful GPU**
-    - Currently only Nvidia GPUs are supported. AMD graphics cards are not supported.
+    - Currently, only Nvidia GPUs are supported. AMD graphics cards are not supported.
       This is not something that we have control over. It is a requirement of the Tensorflow library.
     - The GPU needs to support at least CUDA Compute Capability 3.0 or higher.
       To see which version your GPU supports, consult this list: https://developer.nvidia.com/cuda-gpus
@@ -55,14 +55,14 @@ The type of computations that the process does are well suited for graphics card
 
 ## Supported operating systems
 - **Windows 10**
-  Windows 7 and 8 might work. Your milage may vary. Windows has an installer which will set up everything you need. See: https://github.com/deepfakes/faceswap/releases
+  Windows 7 and 8 might work. Your mileage may vary. Windows has an installer which will set up everything you need. See: https://github.com/deepfakes/faceswap/releases
 - **Linux**
   Most Ubuntu/Debian or CentOS based Linux distributions will work.
 - **macOS**
   GPU support on macOS is limited due to lack of drivers/libraries from Nvidia.
 - All operating systems must be 64-bit for Tensorflow to run.
 
-Alternatively there is a docker image that is based on Debian.
+Alternatively, there is a docker image that is based on Debian.
 
 # Important before you proceed
 **In its current iteration, the project relies heavily on the use of the command line, although a gui is available. if you are unfamiliar with command line tools, you may have difficulty setting up the environment and should perhaps not attempt any of the steps described in this guide.** This guide assumes you have intermediate knowledge of the command line. 
@@ -77,16 +77,16 @@ The developers are also not responsible for any damage you might cause to your o
   - [brew](https://brew.sh/) install python3 (macOS)
 
 - [virtualenv](https://github.com/pypa/virtualenv) and [virtualenvwrapper](https://virtualenvwrapper.readthedocs.io) may help when you are not using docker.
-- If you are using an Nvidia graphics card You should install CUDA (https://developer.nvidia.com/cuda-zone) and CUDNN (https://developer.nvidia.com/cudnn). If you do not plan to build Tensorflow yourself, make sure you install no higher than version 9.0 of CUDA and 7.0.x of CUDNN
+- If you are using an Nvidia graphics card You should install CUDA (https://developer.nvidia.com/cuda-zone) and CUDNN (https://developer.nvidia.com/cudnn). If you do not plan to build Tensorflow yourself, make sure you install no higher than version 10.0 of CUDA and 7.4.x of CUDNN
 - dlib is required for face recognition and is compiled as part of the setup process. You will need the following applications for your os to successfully install dlib (nb: list may be incomplete. Please raise an issue if another prerequisite is required for your OS):
     - Windows: Visual Studio 2015, CMake v3.8.2
     - Linux: build-essential, cmake
     - macOS: xquartz 
 
 ## Getting the faceswap code
-Simply download the code from http://github.com/deepfakes/faceswap - For development it is recommended to use git instead of downloading the code and extracting it.
+Simply download the code from http://github.com/deepfakes/faceswap - For development, it is recommended to use git instead of downloading the code and extracting it.
 
-For now, extract the code to a directory where you're comfortable working with it. Navigate to it with the command line. For our example we will use `~/faceswap/` as our project directory.
+For now, extract the code to a directory where you're comfortable working with it. Navigate to it with the command line. For our example, we will use `~/faceswap/` as our project directory.
 
 ## Setup
 Enter the folder that faceswap has been downloaded to and run:
@@ -208,7 +208,7 @@ Setting up Faceswap can seem a little intimidating to new users, but it isn't th
 
 ## Prerequisites
 ### Microsoft Visual Studio 2015
-**Important** Make sure to downoad the 2015 version of Microsoft Visual Studio
+**Important** Make sure to download the 2015 version of Microsoft Visual Studio
 
 Download and install Microsoft Visual Studio 2015 from: https://go.microsoft.com/fwlink/?LinkId=532606&clcid=0x409
 
@@ -224,7 +224,7 @@ On the install screen:
 ### Cuda
 **GPU Only** If you do not have an Nvidia GPU you can skip this step.
   
-At the time of writing Tensorflow (version 1.12) only supports Cuda up to version 9.0, but check https://www.tensorflow.org/install/gpu for the latest supported version. It is crucial that you download the correct version of Cuda.
+At the time of writing Tensorflow (version 1.13.1) only supports Cuda up to version 10.0, but check https://www.tensorflow.org/install/gpu for the latest supported version. It is crucial that you download the correct version of Cuda.
 
 Download and install the correct version of the Cuda Toolkit from: https://developer.nvidia.com/cuda-toolkit-archive
 
@@ -233,7 +233,7 @@ NB: Make a note of the install folder as you'll need to access it in the next st
 ### cuDNN
 **GPU Only** If you do not have an Nvidia GPU you can skip this step.
 
-As with Cuda you will need to install the correct version of cuDNN that the latest Tensorflow supports. At the time of writing this is Tensorflow v1.12 which supports cuDNN version 7.2, but check https://www.tensorflow.org/install/gpu for the latest supported version.
+As with Cuda you will need to install the correct version of cuDNN that the latest Tensorflow supports. At the time of writing this is Tensorflow v1.13.1 which supports cuDNN version 7.4, but check https://www.tensorflow.org/install/gpu for the latest supported version.
 
 Download cuDNN from https://developer.nvidia.com/cudnn. You will need to create an account with Nvidia. 
 
@@ -253,7 +253,7 @@ When installing CMake make sure to enable the option to CMake to the system path
 
 
 ### Anaconda
-Download and install the latest Python 3 Anacconda from: https://www.anaconda.com/download/. Unless you know what you are doing, you can leave all the options at default.
+Download and install the latest Python 3 Anaconda from: https://www.anaconda.com/download/. Unless you know what you are doing, you can leave all the options at default.
 
 ### Git
 Download and install Git for Windows: https://git-scm.com/download/win. Unless you know what you are doing, you can leave all the options at default.
@@ -305,7 +305,7 @@ Once dlib is installed follow these steps:
 - Enter the following to see the list of commands: `python faceswap.py -h` or enter `python faceswap.py gui` to launch the GUI
 
 ## Create a desktop shortcut
-A desktop shortcut can be added to easily launch staight into the faceswap GUI:
+A desktop shortcut can be added to easily launch straight into the faceswap GUI:
 
 - Open Notepad
 - Paste the following:
@@ -327,7 +327,7 @@ You should only need to follow these steps if you want the latest Dlib code or t
 For reasons outside of our control, this is the trickiest part of the process, and most of the prerequisites you installed are to support just Dlib. It is recommended to build Dlib from source for 3 main reasons:
 1) To get the latest version
 2) Enable GPU Support in Dlib
-3) To prevent yourself running into a whole host of issues later in the process.
+3) To prevent yourself from running into a whole host of issues later in the process.
 
 If you are not bothered about having GPU support or the latest version, scroll to the end of this section for a simple one-liner to install the CPU version of Dlib.
 ### Build Latest Dlib with GPU Support

@@ -6,13 +6,14 @@ import os
 import pickle
 import struct
 from datetime import datetime
+from PIL import Image
 
 import numpy as np
 from scipy import signal
 from sklearn import decomposition
 from tqdm import tqdm
 
-from . import AlignmentData, Annotate, ExtractedFaces, Faces, Frames
+from . import Annotate, ExtractedFaces, Faces, Frames
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -91,31 +92,46 @@ class Check():
                 yield frame_name
 
     def get_multi_faces(self):
-        """ yield each frame that has multiple faces
+        """ yield each frame or face that has multiple faces
             matched in alignments file """
-        if self.type == "faces":
-            self.output_message = "Multiple faces in frame"
-            frame_key = "face_hash"
-            retval_key = "face_fullname"
-        elif self.type == "frames":
-            self.output_message = "Frames with multiple faces"
-            frame_key = "frame_fullname"
-            retval_key = "frame_fullname"
-        logger.debug("frame_key: '%s', retval_key: '%s'", frame_key, retval_key)
+        process_type = getattr(self, "get_multi_faces_{}".format(self.type))
+        for item in process_type():
+            yield item
 
+    def get_multi_faces_frames(self):
+        """ Return Frames that contain multiple faces """
+        self.output_message = "Frames with multiple faces"
         for item in tqdm(self.items, desc=self.output_message):
-            frame = item[frame_key]
-            if self.type == "faces":
-                frame_idx = [(frame, idx)
-                             for frame, idx in self.alignments.hashes_to_frame[frame].items()]
-            retval = item[retval_key]
-            for frame, idx in frame_idx:
-                if self.alignments.frame_has_multiple_faces(frame):
-                    if self.type == "faces":
-                        # Add correct alignments index for moving faces
-                        retval = (retval, idx)
-                    logger.trace("Returning: '%s'", retval)
-                    yield retval
+            filename = item["frame_fullname"]
+            if not self.alignments.frame_has_multiple_faces(filename):
+                continue
+            logger.trace("Returning: '%s'", filename)
+            yield filename
+
+    def get_multi_faces_faces(self):
+        """ Return Faces when there are multiple faces in a frame """
+        self.output_message = "Multiple faces in frame"
+        seen_hash_dupes = set()
+        for item in tqdm(self.items, desc=self.output_message):
+            filename = item["face_fullname"]
+            f_hash = item["face_hash"]
+            frame_idx = [(frame, idx)
+                         for frame, idx in self.alignments.hashes_to_frame[f_hash].items()]
+
+            if len(frame_idx) > 1:
+                # If the same hash exists in multiple frames, select arbitrary frame
+                # and add to seen_hash_dupes so it is not selected again
+                logger.trace("Dupe hashes: %s", frame_idx)
+                frame_idx = [f_i for f_i in frame_idx if f_i not in seen_hash_dupes][0]
+                seen_hash_dupes.add(frame_idx)
+                frame_idx = [frame_idx]
+
+            frame_name, idx = frame_idx[0]
+            if not self.alignments.frame_has_multiple_faces(frame_name):
+                continue
+            retval = (filename, idx)
+            logger.trace("Returning: '%s'", retval)
+            yield retval
 
     def get_missing_alignments(self):
         """ yield each frame that does not exist in alignments file """
@@ -145,7 +161,7 @@ class Check():
             f_hash = face["face_hash"]
             if not self.alignments.hashes_to_frame.get(f_hash, None):
                 logger.debug("Returning: '%s'", face["face_fullname"])
-                yield face["face_fullname"]
+                yield face["face_fullname"], -1
 
     def output_results(self, items_output):
         """ Output the results in the requested format """
@@ -155,7 +171,7 @@ class Check():
         if self.output == "move":
             self.move_file(items_output)
             return
-        if self.job == "multi-faces":
+        if self.job in ("multi-faces", "leftover-faces"):
             # Strip the index for printed/file output
             items_output = [item[0] for item in items_output]
         output_message = "-----------------------------------------------\r\n"
@@ -204,7 +220,7 @@ class Check():
         logger.info("Moving %s faces(s) to '%s'", len(items_output), output_folder)
         for frame, idx in items_output:
             src = os.path.join(self.source_dir, frame)
-            dst_folder = os.path.join(output_folder, str(idx))
+            dst_folder = os.path.join(output_folder, str(idx)) if idx != -1 else output_folder
             if not os.path.isdir(dst_folder):
                 logger.debug("Creating folder: '%s'", dst_folder)
                 os.makedirs(dst_folder)
@@ -434,36 +450,38 @@ class Legacy():
 class Merge():
     """ Merge two alignments files into one """
     def __init__(self, alignments, arguments):
-        self.alignments = alignments
-        self.alignments2 = AlignmentData(arguments.alignments_file2, "json")
+        self.final_alignments = alignments[0]
+        self.process_alignments = alignments[1:]
 
     def process(self):
         """Process the alignments file merge """
         logger.info("[MERGE ALIGNMENTS]")  # Tidy up cli output
         skip_count = 0
         merge_count = 0
-        for _, src_alignments, _, frame in tqdm(self.alignments2.yield_faces(),
-                                                desc="Merging Alignments",
-                                                total=self.alignments2.frames_count):
-            for idx, alignment in enumerate(src_alignments):
-                if not alignment.get("hash", None):
-                    logger.warning("Alignment '%s':%s has no Hash! Skipping", frame, idx)
-                    skip_count += 1
-                    continue
-                if self.check_exists(frame, alignment, idx):
-                    skip_count += 1
-                    continue
-                self.merge_alignment(frame, alignment, idx)
-                merge_count += 1
+        total_count = sum([alignments.frames_count for alignments in self.process_alignments])
+        with tqdm(desc="Merging Alignments", total=total_count) as pbar:
+            for alignments in self.process_alignments:
+                for _, src_alignments, _, frame in alignments.yield_faces():
+                    for idx, alignment in enumerate(src_alignments):
+                        if not alignment.get("hash", None):
+                            logger.warning("Alignment '%s':%s has no Hash! Skipping", frame, idx)
+                            skip_count += 1
+                            continue
+                        if self.check_exists(frame, alignment, idx):
+                            skip_count += 1
+                            continue
+                        self.merge_alignment(frame, alignment, idx)
+                        merge_count += 1
+                    pbar.update(1)
         logger.info("Alignments Merged: %s", merge_count)
         logger.info("Alignments Skipped: %s", skip_count)
         if merge_count != 0:
             self.set_destination_filename()
-            self.alignments.save()
+            self.final_alignments.save()
 
     def check_exists(self, frame, alignment, idx):
         """ Check whether this face already exists """
-        existing_frame = self.alignments.hashes_to_frame.get(alignment["hash"], None)
+        existing_frame = self.final_alignments.hashes_to_frame.get(alignment["hash"], None)
         if not existing_frame:
             return False
         if frame in existing_frame.keys():
@@ -478,14 +496,16 @@ class Merge():
         """ Merge the source alignment into the destination """
         logger.debug("Merging alignment: (frame: %s, src_idx: %s, hash: %s)",
                      frame, idx, alignment["hash"])
-        self.alignments.data.setdefault(frame, list()).append(alignment)
+        self.final_alignments.data.setdefault(frame, list()).append(alignment)
 
     def set_destination_filename(self):
         """ Set the destination filename """
-        orig, ext = os.path.splitext(self.alignments.file)
-        filename = "{}_merged{}".format(orig, ext)
+        folder = os.path.split(self.final_alignments.file)[0]
+        ext = os.path.splitext(self.final_alignments.file)[1]
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(folder, "alignments_merged_{}{}".format(now, ext))
         logger.debug("Output set to: '%s'", filename)
-        self.alignments.file = filename
+        self.final_alignments.file = filename
 
 
 class Reformat():
@@ -510,8 +530,8 @@ class Reformat():
         """ Load alignments from DeepFaceLab and format for Faceswap """
         alignments = dict()
         for face in tqdm(self.faces.file_list_sorted, desc="Converting DFL Faces"):
-            if face["face_extension"] != ".png":
-                logger.verbose("'%s' is not a png. Skipping", face["face_fullname"])
+            if face["face_extension"] not in (".png", ".jpg"):
+                logger.verbose("'%s' is not a png or jpeg. Skipping", face["face_fullname"])
                 continue
             f_hash = face["face_hash"]
             fullpath = os.path.join(self.faces.folder, face["face_fullname"])
@@ -526,6 +546,18 @@ class Reformat():
     @staticmethod
     def get_dfl_alignment(filename):
         """ Process the alignment of one face """
+        ext = os.path.splitext(filename)[1]
+
+        if ext.lower() in (".jpg", ".jpeg"):
+            img = Image.open(filename)
+            try:
+                dfl_alignments = pickle.loads(img.app["APP15"])
+                dfl_alignments["source_rect"] = [n.item()  # comes as non-JSONable np.int32
+                                                 for n in dfl_alignments["source_rect"]]
+                return dfl_alignments
+            except pickle.UnpicklingError:
+                return None
+
         with open(filename, "rb") as dfl:
             header = dfl.read(8)
             if header != b"\x89PNG\r\n\x1a\n":
@@ -711,23 +743,33 @@ class Rename():
     def check_multi_hashes(self, faces, frame, idx):
         """ Check filenames for where multiple faces have the
             same hash (e.g. for freeze frames) """
+        logger.debug("Multiple hashes: (frame: faces: %s, frame: '%s', idx: %s", faces, frame, idx)
         frame_idx = "{}_{}".format(frame, idx)
+        retval = None
         for face_name, extension in faces:
             if (face_name, extension) in self.seen_multihash:
                 # Don't return a filename that has already been processed
+                logger.debug("Already seen: %s", (face_name, extension))
                 continue
             if face_name == frame_idx:
                 # If a matching filename already exists return that
-                self.seen_multihash.add((face_name, extension))
-                return face_name, extension
+                retval = (face_name, extension)
+                logger.debug("Matching filename found: %s", retval)
+                self.seen_multihash.add(retval)
+                break
             if face_name.startswith(frame):
                 # If a matching framename already exists return that
-                self.seen_multihash.add((face_name, extension))
-                return face_name, extension
-        # If no matches, just pop the first filename
-        face_name, extension = faces[0]
-        self.seen_multihash.add((face_name, extension))
-        return face_name, extension
+                retval = (face_name, extension)
+                logger.debug("Matching freamename found: %s", retval)
+                self.seen_multihash.add(retval)
+                break
+        if not retval:
+            # If no matches, just pop the first filename
+            retval = [face for face in faces if face not in self.seen_multihash][0]
+            logger.debug("No matches found. Choosing: %s", retval)
+            self.seen_multihash.add(retval)
+        logger.debug("Returning: %s", retval)
+        return retval
 
 
 class Sort():

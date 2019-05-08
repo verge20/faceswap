@@ -15,7 +15,6 @@ import logging
 import os
 import traceback
 from io import StringIO
-from math import sqrt
 
 import cv2
 import dlib
@@ -34,14 +33,17 @@ def get_config(plugin_name):
 
 class Detector():
     """ Detector object """
-    def __init__(self, loglevel, rotation=None):
-        logger.debug("Initializing %s: (rotation: %s)", self.__class__.__name__, rotation)
+    def __init__(self, loglevel, rotation=None, min_size=0):
+        logger.debug("Initializing %s: (rotation: %s, min_size: %s)",
+                     self.__class__.__name__, rotation, min_size)
         self.config = get_config(".".join(self.__module__.split(".")[-2:]))
         self.loglevel = loglevel
         self.cachepath = os.path.join(os.path.dirname(__file__), ".cache")
         self.rotation = self.get_rotation_angles(rotation)
+        self.min_size = min_size
         self.parent_is_pool = False
         self.init = None
+        self.error = None
 
         # The input and output queues for the plugin.
         # See lib.queue_manager.QueueManager for getting queues
@@ -78,12 +80,10 @@ class Detector():
         """ Inititalize the detector
             Tasks to be run before any detection is performed.
             Override for specific detector """
-        logger_init = kwargs["log_init"]
-        log_queue = kwargs["log_queue"]
-        logger_init(self.loglevel, log_queue)
         logger.debug("initialize %s (PID: %s, args: %s, kwargs: %s)",
                      self.__class__.__name__, os.getpid(), args, kwargs)
         self.init = kwargs.get("event", False)
+        self.error = kwargs.get("error", False)
         self.queues["in"] = kwargs["in_queue"]
         self.queues["out"] = kwargs["out_queue"]
 
@@ -106,6 +106,7 @@ class Detector():
             are passed back to parent.
             Do not override """
         try:
+            logger.debug("Executing detector run function")
             self.detect_faces(*args, **kwargs)
         except Exception as err:  # pylint: disable=broad-except
             logger.error("Caught exception in child process: %s: %s", os.getpid(), str(err))
@@ -127,15 +128,37 @@ class Detector():
             logger.trace("Item out: %s", {key: val
                                           for key, val in output.items()
                                           if key != "image"})
+            if self.min_size > 0 and output.get("detected_faces", None):
+                output["detected_faces"] = self.filter_small_faces(output["detected_faces"])
         else:
             logger.trace("Item out: %s", output)
         self.queues["out"].put(output)
 
+    def filter_small_faces(self, detected_faces):
+        """ Filter out any faces smaller than the min size threshold """
+        retval = list()
+        for face in detected_faces:
+            face_size = ((face.right() - face.left()) ** 2 +
+                         (face.bottom() - face.top()) ** 2) ** 0.5
+            if face_size < self.min_size:
+                logger.debug("Removing detected face: (face_size: %s, min_size: %s",
+                             face_size, self.min_size)
+                continue
+            retval.append(face)
+        return retval
+
     # <<< DETECTION IMAGE COMPILATION METHODS >>> #
-    def compile_detection_image(self, image, is_square, scale_up):
+    def compile_detection_image(self, input_image,
+                                is_square=False, scale_up=False, to_rgb=False, to_grayscale=False):
         """ Compile the detection image """
+        image = input_image.copy()
+        if to_rgb:
+            image = image[:, :, ::-1]
+        elif to_grayscale:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)  # pylint: disable=no-member
         scale = self.set_scale(image, is_square=is_square, scale_up=scale_up)
-        return [self.set_detect_image(image, scale), scale]
+        image = self.scale_image(image, scale)
+        return [image, scale]
 
     def set_scale(self, image, is_square=False, scale_up=False):
         """ Set the scale factor for incoming image """
@@ -147,13 +170,13 @@ class Detector():
             source = max(height, width)
             target = max(self.target)
         else:
+            source = (width * height) ** 0.5
             if isinstance(self.target, tuple):
                 self.target = self.target[0] * self.target[1]
-            source = width * height
-            target = self.target
+            target = self.target ** 0.5
 
         if scale_up or target < source:
-            scale = sqrt(target / source)
+            scale = target / source
         else:
             scale = 1.0
         logger.trace("Detector scale: %s", scale)
@@ -161,10 +184,9 @@ class Detector():
         return scale
 
     @staticmethod
-    def set_detect_image(input_image, scale):
-        """ Convert the image to RGB and scale """
+    def scale_image(image, scale):
+        """ Scale the image """
         # pylint: disable=no-member
-        image = input_image[:, :, ::-1].copy()
         if scale == 1.0:
             return image
 
@@ -304,14 +326,14 @@ class Detector():
     # <<< MISC METHODS >>> #
     @staticmethod
     def get_vram_free():
-        """ Return total free VRAM on largest card """
+        """ Return free and total VRAM on card with most VRAM free"""
         stats = GPUStats()
         vram = stats.get_card_most_free()
         logger.verbose("Using device %s with %sMB free of %sMB",
                        vram["device"],
                        int(vram["free"]),
                        int(vram["total"]))
-        return int(vram["free"])
+        return int(vram["card_id"]), int(vram["free"]), int(vram["total"])
 
     @staticmethod
     def set_predetected(width, height):

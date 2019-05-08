@@ -13,7 +13,9 @@ import os
 import sys
 import subprocess
 import datetime
+from collections import OrderedDict
 
+import imageio_ffmpeg as im_ffm
 from ffmpy import FFprobe, FFmpeg, FFRuntimeError
 
 # faceswap imports
@@ -144,7 +146,7 @@ class Effmpeg():
                                "rotate", "slice"]
 
     # Class variable that stores the target executable (ffmpeg or ffplay)
-    _executable = 'ffmpeg'
+    _executable = im_ffm.get_ffmpeg_exe()
 
     # Class variable that stores the common ffmpeg arguments based on verbosity
     __common_ffmpeg_args_dict = {"normal": "-hide_banner ",
@@ -159,7 +161,7 @@ class Effmpeg():
     def __init__(self, arguments):
         logger.debug("Initializing %s: (arguments: %s)", self.__class__.__name__, arguments)
         self.args = arguments
-        self.exe = "ffmpeg"
+        self.exe = im_ffm.get_ffmpeg_exe()
         self.input = DataItem()
         self.output = DataItem()
         self.ref_vid = DataItem()
@@ -333,7 +335,9 @@ class Effmpeg():
         filename = Effmpeg.__get_extracted_filename(input_.path)
         _input_opts = Effmpeg._common_ffmpeg_args[:]
         _input_path = os.path.join(input_.path, filename)
-        _output_opts = '-vf fps="' + str(fps) + '" '
+        _fps_arg = '-r ' + str(fps) + ' '
+        _input_opts += _fps_arg + "-f image2 "
+        _output_opts = _fps_arg
         if not preview:
             _output_opts = '-y ' + _output_opts + ' -c:v libx264'
         if mux_audio:
@@ -342,7 +346,7 @@ class Effmpeg():
                 raise ValueError("Preview for gen-vid with audio muxing is "
                                  "not supported.")
             _output_opts = _ref_vid_opts + ' ' + _output_opts
-            _inputs = {_input_path: _input_opts, ref_vid.path: None}
+            _inputs = OrderedDict([(_input_path, _input_opts), (ref_vid.path, None)])
         else:
             _inputs = {_input_path: _input_opts}
         _outputs = {output.path: _output_opts}
@@ -359,9 +363,13 @@ class Effmpeg():
             _inputs = {input_: _input_opts}
         else:
             _inputs = {input_.path: _input_opts}
+        logger.debug(_inputs)
         ffp = FFprobe(inputs=_inputs)
         _fps = ffp.run(stdout=subprocess.PIPE)[0].decode("utf-8")
         _fps = _fps.strip()
+        if "/" in _fps:
+            _fps = _fps.split("/")
+            _fps = str(round(int(_fps[0])/int(_fps[1]), 2))
         if print_:
             logger.info("Video fps: %s", _fps)
         logger.debug(_fps)
@@ -429,7 +437,7 @@ class Effmpeg():
             raise ValueError("Preview with audio muxing is not supported.")
         # if not preview:
         #    _output_opts = '-y ' + _output_opts
-        _inputs = {input_.path: _input_opts, ref_vid.path: _ref_vid_opts}
+        _inputs = OrderedDict([(input_.path, _input_opts), (ref_vid.path, _ref_vid_opts)])
         _outputs = {output.path: _output_opts}
         Effmpeg.__run_ffmpeg(exe=exe, inputs=_inputs, outputs=_outputs)
 
@@ -487,7 +495,7 @@ class Effmpeg():
         return all(getattr(self, i).fps is None for i in items_to_check)
 
     @staticmethod
-    def __run_ffmpeg(exe="ffmpeg", inputs=None, outputs=None):
+    def __run_ffmpeg(exe=im_ffm.get_ffmpeg_exe(), inputs=None, outputs=None):
         """ Run ffmpeg """
         logger.debug("Running ffmpeg: (exe: '%s', inputs: %s, outputs: %s", exe, inputs, outputs)
         ffm = FFmpeg(executable=exe, inputs=inputs, outputs=outputs)
@@ -540,11 +548,10 @@ class Effmpeg():
                 filename = file
                 break
         logger.debug("sample filename: '%s'", filename)
-        filename = filename.split('.')
-        img_ext = filename[-1]
-        zero_pad = Effmpeg.__get_zero_pad(filename[-2])
-        name = filename[-2][:-zero_pad]
-        retval = "{}%{}d.{}".format(name, zero_pad, img_ext)
+        filename, img_ext = os.path.splitext(filename)
+        zero_pad = Effmpeg.__get_zero_pad(filename)
+        name = filename[:-zero_pad]
+        retval = "{}%{}d{}".format(name, zero_pad, img_ext)
         logger.debug("filename: %s, img_ext: '%s', zero_pad: %s, name: '%s'",
                      filename, img_ext, zero_pad, name)
         logger.debug(retval)
@@ -554,6 +561,7 @@ class Effmpeg():
     def __get_zero_pad(filename):
         """ Return the starting position of zero padding from a filename """
         chkstring = filename[::-1]
+        logger.trace("filename: %s, chkstring: %s", filename, chkstring)
         pos = 0
         for pos in range(len(chkstring)):
             if not chkstring[pos].isdigit():
