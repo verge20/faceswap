@@ -4,7 +4,6 @@ import logging
 
 import numpy as np
 
-from dlib import rectangle as d_rectangle  # pylint: disable=no-name-in-module
 from lib.aligner import Extract as AlignerExtract, get_align_mat, get_matrix_scaling
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -39,28 +38,24 @@ class DetectedFace():
         """ Landmarks as XY """
         return self.landmarksXY
 
-    def to_dlib_rect(self):
-        """ Return Bounding Box as Dlib Rectangle """
-        left = self.x
-        top = self.y
-        right = self.x + self.w
-        bottom = self.y + self.h
-        retval = d_rectangle(left, top, right, bottom)
+    def to_bounding_box_dict(self):
+        """ Return Bounding Box as a bounding box dixt """
+        retval = dict(left=self.x, top=self.y, right=self.x + self.w, bottom=self.y + self.h)
         logger.trace("Returning: %s", retval)
         return retval
 
-    def from_dlib_rect(self, d_rect, image=None):
-        """ Set Bounding Box from a Dlib Rectangle """
-        logger.trace("Creating from dlib_rectangle: %s", d_rect)
-        if not isinstance(d_rect, d_rectangle):
-            raise ValueError("Supplied Bounding Box is not a dlib.rectangle.")
-        self.x = d_rect.left()
-        self.w = d_rect.right() - d_rect.left()
-        self.y = d_rect.top()
-        self.h = d_rect.bottom() - d_rect.top()
+    def from_bounding_box_dict(self, bounding_box_dict, image=None):
+        """ Set Bounding Box from a bounding box dict """
+        logger.trace("Creating from bounding box dict: %s", bounding_box_dict)
+        if not isinstance(bounding_box_dict, dict):
+            raise ValueError("Supplied Bounding Box is not a dictionary.")
+        self.x = bounding_box_dict["left"]
+        self.w = bounding_box_dict["right"] - bounding_box_dict["left"]
+        self.y = bounding_box_dict["top"]
+        self.h = bounding_box_dict["bottom"] - bounding_box_dict["top"]
         if image is not None and image.any():
             self.image_to_face(image)
-        logger.trace("Created from dlib_rectangle: (x: %s, w: %s, y: %s. h: %s)",
+        logger.trace("Created from bounding box dict: (x: %s, w: %s, y: %s. h: %s)",
                      self.x, self.w, self.y, self.h)
 
     def image_to_face(self, image):
@@ -104,16 +99,20 @@ class DetectedFace():
         """ No need to load aligned information for all uses of this
             class, so only call this to load the information for easy
             reference to aligned properties for this face """
-        logger.trace("Loading aligned face: (size: %s, align_eyes: %s, dtype: %s)",
-                     size, align_eyes, dtype)
-        padding = int(size * self.extract_ratio) // 2
-        self.aligned["size"] = size
-        self.aligned["padding"] = padding
-        self.aligned["align_eyes"] = align_eyes
-        self.aligned["matrix"] = get_align_mat(self, size, align_eyes)
-        if image is None:
-            self.aligned["face"] = None
+        # Don't reload an already aligned face:
+        if self.aligned:
+            logger.trace("Skipping alignment calculation for already aligned face")
         else:
+            logger.trace("Loading aligned face: (size: %s, align_eyes: %s, dtype: %s)",
+                         size, align_eyes, dtype)
+            padding = int(size * self.extract_ratio) // 2
+            self.aligned["size"] = size
+            self.aligned["padding"] = padding
+            self.aligned["align_eyes"] = align_eyes
+            self.aligned["matrix"] = get_align_mat(self, size, align_eyes)
+            self.aligned["face"] = None
+        if image is not None and self.aligned["face"] is None:
+            logger.trace("Getting aligned face")
             face = AlignerExtract().transform(
                 image,
                 self.aligned["matrix"],

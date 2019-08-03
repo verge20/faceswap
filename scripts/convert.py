@@ -5,9 +5,9 @@ import logging
 import re
 import os
 import sys
-from time import sleep
 from threading import Event
 
+from cv2 import imwrite  # pylint:disable=no-name-in-module
 import numpy as np
 from tqdm import tqdm
 
@@ -15,12 +15,12 @@ from scripts.fsmedia import Alignments, Images, PostProcess, Utils
 from lib import Serializer
 from lib.convert import Converter
 from lib.faces_detect import DetectedFace
+from lib.gpu_stats import GPUStats
 from lib.multithreading import MultiThread, PoolProcess, total_cpus
 from lib.queue_manager import queue_manager, QueueEmpty
-from lib.utils import get_folder, get_image_paths, hash_image_file
+from lib.utils import FaceswapError, get_folder, get_image_paths, hash_image_file
+from plugins.extract.pipeline import Extractor
 from plugins.plugin_loader import PluginLoader
-
-from .extract import Plugins as Extractor
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -41,24 +41,26 @@ class Convert():
 
         self.add_queues()
         self.disk_io = DiskIO(self.alignments, self.images, arguments)
-        self.extractor = None
         self.predictor = Predict(self.disk_io.load_queue, self.queue_size, arguments)
+
+        configfile = self.args.configfile if hasattr(self.args, "configfile") else None
         self.converter = Converter(get_folder(self.args.output_dir),
                                    self.predictor.output_size,
                                    self.predictor.has_predicted_mask,
                                    self.disk_io.draw_transparent,
                                    self.disk_io.pre_encode,
-                                   arguments)
+                                   arguments,
+                                   configfile=configfile)
 
         logger.debug("Initialized %s", self.__class__.__name__)
 
     @property
     def queue_size(self):
-        """ Set q-size to double number of cpus available """
+        """ Set 16 for singleprocess otherwise 32 """
         if self.args.singleprocess:
-            retval = 2
+            retval = 16
         else:
-            retval = total_cpus() * 2
+            retval = 32
         logger.debug(retval)
         return retval
 
@@ -67,8 +69,11 @@ class Convert():
         """ return the maximum number of pooled processes to use """
         if self.args.singleprocess:
             retval = 1
+        elif self.args.jobs > 0:
+            retval = min(self.args.jobs, total_cpus(), self.images.images_found)
         else:
             retval = min(total_cpus(), self.images.images_found)
+        retval = 1 if retval == 0 else retval
         logger.debug(retval)
         return retval
 
@@ -93,31 +98,52 @@ class Convert():
     def process(self):
         """ Process the conversion """
         logger.debug("Starting Conversion")
-        # queue_manager.debug_monitor(2)
-        self.convert_images()
-        self.disk_io.save_thread.join()
-        queue_manager.terminate_queues()
+        # queue_manager.debug_monitor(5)
+        try:
+            self.convert_images()
+            self.disk_io.save_thread.join()
+            queue_manager.terminate_queues()
 
-        Utils.finalize(self.images.images_found,
-                       self.predictor.faces_count,
-                       self.predictor.verify_output)
-        logger.debug("Completed Conversion")
+            Utils.finalize(self.images.images_found,
+                           self.predictor.faces_count,
+                           self.predictor.verify_output)
+            logger.debug("Completed Conversion")
+        except MemoryError as err:
+            msg = ("Faceswap ran out of RAM running convert. Conversion is very system RAM "
+                   "heavy, so this can happen in certain circumstances when you have a lot of "
+                   "cpus but not enough RAM to support them all."
+                   "\nYou should lower the number of processes in use by either setting the "
+                   "'singleprocess' flag (-sp) or lowering the number of parallel jobs (-j).")
+            raise FaceswapError(msg) from err
 
     def convert_images(self):
         """ Convert the images """
         logger.debug("Converting images")
         save_queue = queue_manager.get_queue("convert_out")
         patch_queue = queue_manager.get_queue("patch")
+        completion_queue = queue_manager.get_queue("patch_completed")
         pool = PoolProcess(self.converter.process, patch_queue, save_queue,
+                           completion_queue=completion_queue,
                            processes=self.pool_processes)
         pool.start()
+        completed_count = 0
         while True:
             self.check_thread_error()
             if self.disk_io.completion_event.is_set():
+                logger.debug("DiskIO completion event set. Joining Pool")
                 break
-            sleep(1)
+            try:
+                completed = completion_queue.get(True, 1)
+            except QueueEmpty:
+                continue
+            completed_count += completed
+            logger.debug("Total process pools completed: %s of %s", completed_count, pool.procs)
+            if completed_count == pool.procs:
+                logger.debug("All processes completed. Joining Pool")
+                break
         pool.join()
 
+        logger.debug("Putting EOF")
         save_queue.put("EOF")
         logger.debug("Converted images")
 
@@ -125,31 +151,6 @@ class Convert():
         """ Check and raise thread errors """
         for thread in (self.predictor.thread, self.disk_io.load_thread, self.disk_io.save_thread):
             thread.check_and_raise_error()
-
-    def patch_iterator(self, processes):
-        """ Prepare the images for conversion """
-        out_queue = queue_manager.get_queue("out")
-        completed = 0
-
-        while True:
-            try:
-                item = out_queue.get(True, 1)
-            except QueueEmpty:
-                self.check_thread_error()
-                continue
-            self.check_thread_error()
-
-            if item == "EOF":
-                completed += 1
-                logger.debug("Got EOF %s of %s", completed, processes)
-                if completed == processes:
-                    break
-                continue
-
-            logger.trace("Yielding: '%s'", item[0])
-            yield item
-        logger.debug("iterator exhausted")
-        return "EOF"
 
 
 class DiskIO():
@@ -164,16 +165,14 @@ class DiskIO():
         self.args = arguments
         self.pre_process = PostProcess(arguments)
         self.completion_event = Event()
-        self.frame_ranges = self.get_frame_ranges()
-        self.writer = self.get_writer()
 
         # For frame skipping
         self.imageidxre = re.compile(r"(\d+)(?!.*\d\.)(?=\.\w+$)")
+        self.frame_ranges = self.get_frame_ranges()
+        self.writer = self.get_writer()
 
         # Extractor for on the fly detection
-        self.extractor = None
-        if not self.alignments.have_alignments_file:
-            self.load_extractor()
+        self.extractor = self.load_extractor()
 
         self.load_queue = None
         self.save_queue = None
@@ -212,14 +211,15 @@ class DiskIO():
         """ Return the writer plugin """
         args = [self.args.output_dir]
         if self.args.writer in ("ffmpeg", "gif"):
-            args.append(self.total_count)
+            args.extend([self.total_count, self.frame_ranges])
         if self.args.writer == "ffmpeg":
             if self.images.is_video:
                 args.append(self.args.input_dir)
             else:
                 args.append(self.args.reference_video)
         logger.debug("Writer args: %s", args)
-        return PluginLoader.get_converter("writer", self.args.writer)(*args)
+        configfile = self.args.configfile if hasattr(self.args, "configfile") else None
+        return PluginLoader.get_converter("writer", self.args.writer)(*args, configfile=configfile)
 
     def get_frame_ranges(self):
         """ split out the frame ranges and parse out 'min' and 'max' values """
@@ -227,27 +227,50 @@ class DiskIO():
             logger.debug("No frame range set")
             return None
 
-        minmax = {"min": 0,  # never any frames less than 0
-                  "max": float("inf")}
-        retval = [tuple(map(lambda q: minmax[q] if q in minmax.keys() else int(q), v.split("-")))
-                  for v in self.args.frame_ranges]
+        minframe, maxframe = None, None
+        if self.images.is_video:
+            minframe, maxframe = 1, self.images.images_found
+        else:
+            indices = [int(self.imageidxre.findall(os.path.basename(filename))[0])
+                       for filename in self.images.input_images]
+            if indices:
+                minframe, maxframe = min(indices), max(indices)
+        logger.debug("minframe: %s, maxframe: %s", minframe, maxframe)
+
+        if minframe is None or maxframe is None:
+            logger.error("Frame Ranges specified, but could not determine frame numbering "
+                         "from filenames")
+            exit(1)
+
+        retval = list()
+        for rng in self.args.frame_ranges:
+            if "-" not in rng:
+                logger.error("Frame Ranges not specified in the correct format")
+                exit(1)
+            start, end = rng.split("-")
+            retval.append((max(int(start), minframe), min(int(end), maxframe)))
         logger.debug("frame ranges: %s", retval)
         return retval
 
     def load_extractor(self):
         """ Set on the fly extraction """
+        if self.alignments.have_alignments_file:
+            return None
+
         logger.debug("Loading extractor")
         logger.warning("No Alignments file found. Extracting on the fly.")
         logger.warning("NB: This will use the inferior cv2-dnn for extraction "
-                       "and dlib pose predictor for landmarks. It is recommended "
-                       "to perfom Extract first for superior results")
-        extract_args = {"detector": "cv2_dnn",
-                        "aligner": "dlib",
-                        "loglevel": self.args.loglevel}
-        self.extractor = Extractor(None, converter_args=extract_args)
-        self.extractor.launch_detector()
-        self.extractor.launch_aligner()
+                       "and  landmarks. It is recommended to perfom Extract first for "
+                       "superior results")
+        extractor = Extractor(detector="cv2-dnn",
+                              aligner="cv2-dnn",
+                              loglevel=self.args.loglevel,
+                              multiprocess=False,
+                              rotate_images=None,
+                              min_size=20)
+        extractor.launch()
         logger.debug("Loaded extractor")
+        return extractor
 
     def init_threads(self):
         """ Initialize queues and threads """
@@ -283,14 +306,14 @@ class DiskIO():
     def load(self, *args):  # pylint: disable=unused-argument
         """ Load the images with detected_faces"""
         logger.debug("Load Images: Start")
-        extract_queue = queue_manager.get_queue("extract_in") if self.extractor else None
         idx = 0
         for filename, image in self.images.load():
             idx += 1
             if self.load_queue.shutdown.is_set():
                 logger.debug("Load Queue: Stop signal received. Terminating")
                 break
-            if image is None or not image.any():
+            if image is None or (not image.any() and image.ndim not in ((2, 3))):
+                # All black frames will return not np.any() so check dims too
                 logger.warning("Unable to open image. Skipping: '%s'", filename)
                 continue
             if self.check_skipframe(filename):
@@ -302,11 +325,12 @@ class DiskIO():
                     logger.trace("Discarding frame: '%s'", filename)
                 continue
 
-            detected_faces = self.get_detected_faces(filename, image, extract_queue)
+            detected_faces = self.get_detected_faces(filename, image)
             item = dict(filename=filename, image=image, detected_faces=detected_faces)
             self.pre_process.do_actions(item)
             self.load_queue.put(item)
 
+        logger.debug("Putting EOF")
         self.load_queue.put("EOF")
         logger.debug("Load Images: Complete")
 
@@ -321,15 +345,16 @@ class DiskIO():
             return False
         idx = int(indices[0]) if indices else None
         skipframe = not any(map(lambda b: b[0] <= idx <= b[1], self.frame_ranges))
+        logger.trace("idx: %s, skipframe: %s", idx, skipframe)
         return skipframe
 
-    def get_detected_faces(self, filename, image, extract_queue):
+    def get_detected_faces(self, filename, image):
         """ Return detected faces from alignments or detector """
         logger.trace("Getting faces for: '%s'", filename)
         if not self.extractor:
             detected_faces = self.alignments_faces(os.path.basename(filename), image)
         else:
-            detected_faces = self.detect_faces(extract_queue, filename, image)
+            detected_faces = self.detect_faces(filename, image)
         logger.trace("Got %s faces for: '%s'", len(detected_faces), filename)
         return detected_faces
 
@@ -355,12 +380,12 @@ class DiskIO():
                        "skipping".format(frame))
         return have_alignments
 
-    def detect_faces(self, load_queue, filename, image):
+    def detect_faces(self, filename, image):
         """ Extract the face from a frame (If alignments file not found) """
         inp = {"filename": filename,
                "image": image}
-        load_queue.put(inp)
-        faces = next(self.extractor.detect_faces())
+        self.extractor.input_queue.put(inp)
+        faces = next(self.extractor.detected_faces())
 
         landmarks = faces["landmarks"]
         detected_faces = faces["detected_faces"]
@@ -368,7 +393,7 @@ class DiskIO():
 
         for idx, face in enumerate(detected_faces):
             detected_face = DetectedFace()
-            detected_face.from_dlib_rect(face)
+            detected_face.from_bounding_box_dict(face)
             detected_face.landmarksXY = landmarks[idx]
             final_faces.append(detected_face)
         return final_faces
@@ -377,14 +402,22 @@ class DiskIO():
     def save(self, completion_event):
         """ Save the converted images """
         logger.debug("Save Images: Start")
-        for _ in tqdm(range(self.total_count), desc="Converting", file=sys.stdout):
+        write_preview = self.args.redirect_gui and self.writer.is_stream
+        preview_image = os.path.join(self.writer.output_folder, ".gui_preview.jpg")
+        logger.debug("Write preview for gui: %s", write_preview)
+        for idx in tqdm(range(self.total_count), desc="Converting", file=sys.stdout):
             if self.save_queue.shutdown.is_set():
                 logger.debug("Save Queue: Stop signal received. Terminating")
                 break
             item = self.save_queue.get()
             if item == "EOF":
+                logger.debug("EOF Received")
                 break
             filename, image = item
+            # Write out preview image for the GUI every 10 frames if writing to stream
+            if write_preview and idx % 10 == 0 and not os.path.exists(preview_image):
+                logger.debug("Writing GUI Preview image: '%s'", preview_image)
+                imwrite(preview_image, image)
             self.writer.write(filename, image)
         self.writer.close()
         completion_event.set()
@@ -396,7 +429,7 @@ class Predict():
     def __init__(self, in_queue, queue_size, arguments):
         logger.debug("Initializing %s: (args: %s, queue_size: %s, in_queue: %s)",
                      self.__class__.__name__, arguments, queue_size, in_queue)
-        self.batchsize = min(queue_size, 16)
+        self.batchsize = self.get_batchsize(queue_size)
         self.args = arguments
         self.in_queue = in_queue
         self.out_queue = queue_manager.get_queue("patch")
@@ -404,6 +437,8 @@ class Predict():
         self.faces_count = 0
         self.verify_output = False
         self.model = self.load_model()
+        self.output_indices = {"face": self.model.largest_face_index,
+                               "mask": self.model.largest_mask_index}
         self.predictor = self.model.converter(self.args.swap_model)
         self.queues = dict()
 
@@ -438,6 +473,17 @@ class Predict():
         """ Return whether this model has a predicted mask """
         return bool(self.model.state.mask_shapes)
 
+    @staticmethod
+    def get_batchsize(queue_size):
+        """ Get the batchsize """
+        logger.debug("Getting batchsize")
+        is_cpu = GPUStats().device_count == 0
+        batchsize = 1 if is_cpu else 16
+        batchsize = min(queue_size, batchsize)
+        logger.debug("Batchsize: %s", batchsize)
+        logger.debug("Got batchsize: %s", batchsize)
+        return batchsize
+
     def load_model(self):
         """ Load the model requested for conversion """
         logger.debug("Loading Model")
@@ -446,13 +492,14 @@ class Predict():
             logger.error("%s does not exist.", self.args.model_dir)
             exit(1)
         trainer = self.get_trainer(model_dir)
-        model = PluginLoader.get_model(trainer)(model_dir, self.args.gpus, predict=True)
+        gpus = 1 if not hasattr(self.args, "gpus") else self.args.gpus
+        model = PluginLoader.get_model(trainer)(model_dir, gpus, predict=True)
         logger.debug("Loaded Model")
         return model
 
     def get_trainer(self, model_dir):
         """ Return the trainer name if provided, or read from state file """
-        if self.args.trainer:
+        if hasattr(self.args, "trainer") and self.args.trainer:
             logger.debug("Trainer name provided: '%s'", self.args.trainer)
             return self.args.trainer
 
@@ -460,7 +507,7 @@ class Predict():
                      if fname.endswith("_state.json")]
         if len(statefile) != 1:
             logger.error("There should be 1 state file in your model folder. %s were found. "
-                         "Specify a trainer with the '-t', '--trainer' option.")
+                         "Specify a trainer with the '-t', '--trainer' option.", len(statefile))
             exit(1)
         statefile = os.path.join(str(model_dir), statefile[0])
 
@@ -478,12 +525,19 @@ class Predict():
     def predict_faces(self):
         """ Get detected faces from images """
         faces_seen = 0
+        consecutive_no_faces = 0
         batch = list()
         while True:
             item = self.in_queue.get()
             if item != "EOF":
                 logger.trace("Got from queue: '%s'", item["filename"])
                 faces_count = len(item["detected_faces"])
+
+                # Safety measure. If a large stream of frames appear that do not have faces,
+                # these will stack up into RAM. Keep a count of consecutive frames with no faces.
+                # If self.batchsize number of frames appear, force the current batch through
+                # to clear RAM.
+                consecutive_no_faces = consecutive_no_faces + 1 if faces_count == 0 else 0
                 self.faces_count += faces_count
                 if faces_count > 1:
                     self.verify_output = True
@@ -495,8 +549,10 @@ class Predict():
                 faces_seen += faces_count
                 batch.append(item)
 
-            if faces_seen < self.batchsize and item != "EOF":
-                logger.trace("Continuing. Current batchsize: %s", faces_seen)
+            if item != "EOF" and (faces_seen < self.batchsize and
+                                  consecutive_no_faces < self.batchsize):
+                logger.trace("Continuing. Current batchsize: %s, consecutive_no_faces: %s",
+                             faces_seen, consecutive_no_faces)
                 continue
 
             if batch:
@@ -512,12 +568,15 @@ class Predict():
 
                 self.queue_out_frames(batch, predicted)
 
+            consecutive_no_faces = 0
             faces_seen = 0
             batch = list()
             if item == "EOF":
-                logger.debug("Load queue complete")
+                logger.debug("EOF Received")
                 break
+        logger.debug("Putting EOF")
         self.out_queue.put("EOF")
+        logger.debug("Load queue complete")
 
     def load_aligned(self, item):
         """ Load the feed faces and reference output faces """
@@ -556,11 +615,24 @@ class Predict():
         predicted = predicted if isinstance(predicted, list) else [predicted]
         logger.trace("Output shape(s): %s", [predict.shape for predict in predicted])
 
+        predicted = self.filter_multi_out(predicted)
+
         # Compile masks into alpha channel or keep raw faces
         predicted = np.concatenate(predicted, axis=-1) if len(predicted) == 2 else predicted[0]
         predicted = predicted.astype("float32")
 
         logger.trace("Final shape: %s", predicted.shape)
+        return predicted
+
+    def filter_multi_out(self, predicted):
+        """ Filter the predicted output to the final output """
+        if not predicted:
+            return predicted
+        face = predicted[self.output_indices["face"]]
+        mask_idx = self.output_indices["mask"]
+        mask = predicted[mask_idx] if mask_idx is not None else None
+        predicted = [face, mask] if mask is not None else [face]
+        logger.trace("Filtered output shape(s): %s", [predict.shape for predict in predicted])
         return predicted
 
     def queue_out_frames(self, batch, swapped_faces):

@@ -7,7 +7,6 @@ import logging
 
 import cv2
 import numpy as np
-from lib.model import masks as model_masks
 
 from plugins.plugin_loader import PluginLoader
 
@@ -17,50 +16,74 @@ logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 class Converter():
     """ Swap a source face with a target """
     def __init__(self, output_dir, output_size, output_has_mask,
-                 draw_transparent, pre_encode, arguments):
+                 draw_transparent, pre_encode, arguments, configfile=None):
         logger.debug("Initializing %s: (output_dir: '%s', output_size: %s,  output_has_mask: %s, "
-                     "draw_transparent: %s, pre_encode: %s, arguments: %s)",
+                     "draw_transparent: %s, pre_encode: %s, arguments: %s, configfile: %s)",
                      self.__class__.__name__, output_dir, output_size, output_has_mask,
-                     draw_transparent, pre_encode, arguments)
+                     draw_transparent, pre_encode, arguments, configfile)
         self.output_dir = output_dir
         self.draw_transparent = draw_transparent
         self.writer_pre_encode = pre_encode
         self.scale = arguments.output_scale / 100
+        self.output_size = output_size
+        self.output_has_mask = output_has_mask
         self.args = arguments
+        self.configfile = configfile
         self.adjustments = dict(box=None, mask=None, color=None, seamless=None, scaling=None)
-        self.load_plugins(output_size, output_has_mask)
+        self.load_plugins()
         logger.debug("Initialized %s", self.__class__.__name__)
 
-    def load_plugins(self, output_size, output_has_mask):
-        """ Load the requested adjustment plugins """
-        logger.debug("Loading plugins")
-        self.adjustments["box"] = PluginLoader.get_converter("mask", "box_blend")(
-            "none",
-            output_size)
+    def reinitialize(self, config):
+        """ reinitialize converter """
+        logger.debug("Reinitializing converter")
+        self.adjustments = dict(box=None, mask=None, color=None, seamless=None, scaling=None)
+        self.load_plugins(config=config, disable_logging=True)
+        logger.debug("Reinitialized converter")
 
-        self.adjustments["mask"] = PluginLoader.get_converter("mask", "mask_blend")(
-            self.args.mask_type,
-            output_size,
-            output_has_mask)
+    def load_plugins(self, config=None, disable_logging=False):
+        """ Load the requested adjustment plugins """
+        logger.debug("Loading plugins. config: %s", config)
+        self.adjustments["box"] = PluginLoader.get_converter(
+            "mask",
+            "box_blend",
+            disable_logging=disable_logging)("none",
+                                             self.output_size,
+                                             configfile=self.configfile,
+                                             config=config)
+
+        self.adjustments["mask"] = PluginLoader.get_converter(
+            "mask",
+            "mask_blend",
+            disable_logging=disable_logging)(self.args.mask_type,
+                                             self.output_size,
+                                             self.output_has_mask,
+                                             configfile=self.configfile,
+                                             config=config)
 
         if self.args.color_adjustment != "none" and self.args.color_adjustment is not None:
-            self.adjustments["color"] = PluginLoader.get_converter("color",
-                                                                   self.args.color_adjustment)()
+            self.adjustments["color"] = PluginLoader.get_converter(
+                "color",
+                self.args.color_adjustment,
+                disable_logging=disable_logging)(configfile=self.configfile, config=config)
 
         if self.args.scaling != "none" and self.args.scaling is not None:
-            self.adjustments["scaling"] = PluginLoader.get_converter("scaling",
-                                                                     self.args.scaling)()
+            self.adjustments["scaling"] = PluginLoader.get_converter(
+                "scaling",
+                self.args.scaling,
+                disable_logging=disable_logging)(configfile=self.configfile, config=config)
         logger.debug("Loaded plugins: %s", self.adjustments)
 
-    def process(self, in_queue, out_queue):
+    def process(self, in_queue, out_queue, completion_queue=None):
         """ Process items from the queue """
-        logger.debug("Starting convert process. (in_queue: %s, out_queue: %s)",
-                     in_queue, out_queue)
+        logger.debug("Starting convert process. (in_queue: %s, out_queue: %s, completion_queue: "
+                     "%s)", in_queue, out_queue, completion_queue)
         while True:
             item = in_queue.get()
             if item == "EOF":
+                logger.debug("EOF Received")
                 logger.debug("Patch queue finished")
                 # Signal EOF to other processes in pool
+                logger.debug("Putting EOF back to in_queue")
                 in_queue.put(item)
                 break
             logger.trace("Patch queue got: '%s'", item["filename"])
@@ -81,6 +104,9 @@ class Converter():
             logger.trace("Out queue put: %s", item["filename"])
             out_queue.put((item["filename"], image))
         logger.debug("Completed convert process")
+        # Signal that this process has finished
+        if completion_queue is not None:
+            completion_queue.put(1)
 
     def patch_image(self, predicted):
         """ Patch the image """
@@ -161,33 +187,17 @@ class Converter():
         if self.adjustments["scaling"] is not None:
             new_image = self.adjustments["scaling"].run(new_image)
 
-        mask = np.repeat(new_image[:, :, -1][:, :, np.newaxis], 3, axis=-1)
-        foreground = new_image[:, :, :3]
-        background = (predicted["image"][:, :, :3] / 255.0) * (1.0 - mask)
+        if self.draw_transparent:
+            frame = new_image
+        else:
+            mask = np.repeat(new_image[:, :, -1][:, :, np.newaxis], 3, axis=-1)
+            foreground = new_image[:, :, :3]
+            background = (predicted["image"][:, :, :3] / 255.0) * (1.0 - mask)
 
-        foreground *= mask
-        frame = foreground + background
-        frame = self.add_alpha_mask(frame, predicted)
+            foreground *= mask
+            frame = foreground + background
 
         np.clip(frame, 0.0, 1.0, out=frame)
-        return frame
-
-    def add_alpha_mask(self, frame, predicted):
-        """ Adding a 4th channel should happen after all other channel operations
-            Add the default mask as 4th channel for saving as image with alpha channel """
-        if not self.draw_transparent:
-            return frame
-        logger.trace("Creating transparent image: '%s'", predicted["filename"])
-        mask_type = getattr(model_masks, model_masks.get_default_mask())
-        final_mask = np.zeros(frame.shape[:2] + (1, ), dtype="float32")
-
-        for detected_face in predicted["detected_faces"]:
-            landmarks = detected_face.landmarks_as_xy
-            final_mask = cv2.bitwise_or(final_mask,  # pylint: disable=no-member
-                                        mask_type(landmarks, frame, channels=1).mask)
-        final_mask = np.expand_dims(final_mask, axis=-1) if final_mask.ndim == 2 else final_mask
-        frame = np.concatenate((frame, final_mask), axis=-1)
-        logger.trace("Created transparent image: '%s'", predicted["filename"])
         return frame
 
     def scale_image(self, frame):
@@ -200,4 +210,4 @@ class Converter():
                 round((frame.shape[0] / 2 * self.scale) * 2))
         frame = cv2.resize(frame, dims, interpolation=interp)  # pylint: disable=no-member
         logger.trace("resized frame: %s", frame.shape)
-        return frame
+        return np.clip(frame, 0.0, 1.0)

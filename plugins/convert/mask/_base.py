@@ -12,24 +12,37 @@ from plugins.convert._config import Config
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
-def get_config(plugin_name):
+def get_config(plugin_name, configfile=None):
     """ Return the config for the requested model """
-    return Config(plugin_name).config_dict
+    return Config(plugin_name, configfile=configfile).config_dict
 
 
 class Adjustment():
     """ Parent class for adjustments """
-    def __init__(self, mask_type, output_size, predicted_available):
+    def __init__(self, mask_type, output_size, predicted_available, configfile=None, config=None):
         logger.debug("Initializing %s: (arguments: '%s', output_size: %s, "
-                     "predicted_available: %s)",
-                     self.__class__.__name__, mask_type, output_size, predicted_available)
-        self.config = get_config(".".join(self.__module__.split(".")[-2:]))
+                     "predicted_available: %s, configfile: %s, config: %s)",
+                     self.__class__.__name__, mask_type, output_size, predicted_available,
+                     configfile, config)
+        self.config = self.set_config(configfile, config)
         logger.debug("config: %s", self.config)
         self.mask_type = self.get_mask_type(mask_type, predicted_available)
         self.dummy = np.zeros((output_size, output_size, 3), dtype='float32')
 
         self.skip = self.config.get("type", None) is None
         logger.debug("Initialized %s", self.__class__.__name__)
+
+    def set_config(self, configfile, config):
+        """ Set the config to either global config or passed in config """
+        section = ".".join(self.__module__.split(".")[-2:])
+        if config is None:
+            retval = get_config(section, configfile=configfile)
+        else:
+            config.section = section
+            retval = config.config_dict
+            config.section = None
+        logger.debug("Config: %s", retval)
+        return retval
 
     @staticmethod
     def get_mask_type(mask_type, predicted_available):
